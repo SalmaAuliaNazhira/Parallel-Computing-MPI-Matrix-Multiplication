@@ -235,306 +235,214 @@ void write_checkerboard_matrix(
 {
     void *buffer;         /* Room to hold 1 matrix row */
     int coords[2];      /* Grid coords of process
-                                 sending elements */
+                                     sending elements */
     int datum_size;     /* Bytes per matrix element */
-    int els;            /* Elements received */
+    int elt;            /* Element index */
     int grid_coords[2]; /* Coords of this process */
-    int grid_id;        /* Process rank in grid */
+    int grid_id;        /* Process rank */
     int grid_period[2]; /* Wraparound */
-    int grid_size[2];   /* Dims of process grid */
+    int grid_size[2];   /* Dimensions of process grid */
     int i, j, k;
-    void *laddr;          /* Where to put subrow */
-    int local_cols;     /* Matrix cols on this proc */
-    int p;              /* Number of processes */
+    FILE *outfileptr;       /* Output file pointer */
+    void *raddr;          /* Address of 1st element
+                                     to send */
     int src;            /* ID of proc with subrow */
     MPI_Status status;         /* Result of receive */
-    FILE *outfileptr;     /* Output file */
+    int local_rows;     /* This proc's matrix row count */
 
     MPI_Comm_rank(grid_comm, &grid_id);
-    MPI_Comm_size(grid_comm, &p);
     datum_size = get_size(dtype);
 
-    if (grid_id == 0) {
-        outfileptr = fopen(s, "w");
-        if (!outfileptr ||
-            fwrite(&m, sizeof(int), 1, outfileptr) != 1 ||
-            fwrite(&n, sizeof(int), 1, outfileptr) != 1)
-            MPI_Abort(MPI_COMM_WORLD, -1);
-    }
+    /* Matrix element type. */
 
+    /* Set up the Cartesian topology; get the coordinates
+       of this process in the grid. */
     MPI_Cart_get(grid_comm, 2, grid_size, grid_period,
                  grid_coords);
-    local_cols = BLOCK_SIZE(grid_coords[1], grid_size[1], n);
 
-    if (!grid_id)
+    local_rows = BLOCK_SIZE(grid_coords[0], grid_size[0], m);
+
+    if (grid_id == 0)
         buffer = my_malloc(grid_id, n * datum_size);
 
-    /* For each row of the process grid */
+    /* For each process row...*/
     for (i = 0; i < grid_size[0]; i++) {
         coords[0] = i;
 
-        /* For each matrix row controlled by the process row */
+        /* For each matrix row controlled by the process row...*/
         for (j = 0; j < BLOCK_SIZE(i, grid_size[0], m); j++) {
 
             /* Collect the matrix row on grid process 0 and
                print it */
-            if (!grid_id) {
-                for (k = 0; k < grid_size[1]; k++) {
-                    coords[1] = k;
-                    MPI_Cart_rank(grid_comm, coords, &src);
-                    els = BLOCK_SIZE(k, grid_size[1], n);
-                    laddr = buffer +
-                            BLOCK_LOW(k, grid_size[1], n) * datum_size;
+            if (grid_coords[0] == i)
+                raddr = a[j];
+
+            coords[1] = 0;
+            for (k = 0; k < grid_size[1]; k++) {
+                coords[1] = k;
+                MPI_Cart_rank(grid_comm, coords, &src);
+
+                /* Process src sends elements */
+                if (grid_id == 0) {
                     if (src == 0) {
-                        memcpy (laddr, a[j], els * datum_size);
+                        if (grid_coords[0] == i) {
+                            memcpy(buffer, raddr, BLOCK_SIZE(k, grid_size[1], n) * datum_size);
+                            raddr += BLOCK_SIZE(k, grid_size[1], n) * datum_size;
+                        }
                     } else {
-                        MPI_Recv(laddr, els, dtype, src, 0,
-                                 grid_comm, &status);
+                        MPI_Recv(buffer, BLOCK_SIZE(k, grid_size[1], n),
+                                 dtype, src, 0, grid_comm, &status);
                     }
+                    outfileptr = fopen(s, "a");
+                    fwrite(buffer, datum_size, BLOCK_SIZE(k, grid_size[1], n),
+                           outfileptr);
+                    fclose(outfileptr);
+                } else if (grid_id == src) {
+                    MPI_Send(raddr,
+                             BLOCK_SIZE(k, grid_size[1], n), dtype, 0, 0, grid_comm);
+                    raddr += BLOCK_SIZE(k, grid_size[1], n) * datum_size;
                 }
-
-                if (fwrite(buffer, datum_size, n, outfileptr) != n)
-                    MPI_Abort(MPI_COMM_WORLD, -1);
-            } else if (grid_coords[0] == i) {
-                MPI_Send(a[j], local_cols, dtype, 0, 0,
-                         grid_comm);
             }
         }
     }
-    if (!grid_id) {
-        free(buffer);
-        fclose(outfileptr);
-    }
+    if (grid_id == 0) free(buffer);
 }
 
-/* recursive, block-oriented, sequential matrix multiplication */
-void my_matmul(int crow, int ccol, /* corner of C block */
-               int arow, int acol, /* corner of A block */
-               int brow, int bcol, /* corner of B block */
-               int l, int m, int n, /* block A is l*m, block B is m*n, block C is l*n */
-               int N, /* matrices are N*N */
-               datatype **a, datatype **b, datatype **c) { /* 2D matrices */
+/*
+ *  Get the dimensions of the submatrix stored on this
+ *  process.
+ */
+void get_local_matrix_size(
+        int n,                /* IN -Global matrix size */
+        int grid_size,        /* IN -Number of processes
+                                         per dimension */
+        int grid_coord,       /* IN -Column or row coordinate
+                                         of this process */
+        int *submatrix_size)  /* OUT -Number of elements */
+{
+    *submatrix_size = n / grid_size;
+}
+
+
+/* Set up the grid of processes. */
+void setup_grid(
+        MPI_Comm *grid_comm,  /* OUT - Communicator */
+        int *grid_size,       /* OUT - Dimensions of process
+                                         grid */
+        int *grid_id,         /* OUT - Process rank */
+        int *grid_coord)      /* OUT - Process coordinates */
+{
+    int free_coords[2];    /* Grid dimensions */
+    int periods[2];        /* Wraparound */
+
+    /* Set up global grid of processes. */
+    MPI_Comm_size(MPI_COMM_WORLD, &grid_size[0]);
+    grid_size[0] = sqrt(grid_size[0]);
+    grid_size[1] = grid_size[0];
+
+    periods[0] = 1;
+    periods[1] = 1;
+    MPI_Cart_create(MPI_COMM_WORLD, 2, grid_size, periods, 1, grid_comm);
+    MPI_Comm_rank(*grid_comm, grid_id);
+    MPI_Cart_coords(*grid_comm, *grid_id, 2, grid_coord);
+
+    /* Set up row communicators. */
+    free_coords[0] = 0;
+    free_coords[1] = 1;
+}
+
+void matmul(
+        datatype **a,              /* IN - Matrix A */
+        datatype **b,              /* IN - Matrix B */
+        datatype ***c,             /* OUT - Matrix C */
+        int ldim,                  /* IN - Leading dimension */
+        MPI_Comm grid_comm)        /* IN - Communicator */
+{
     int i, j, k;
-    int lhalf[3], mhalf[3], nhalf[3]; /* quadrant sizes */
-    datatype *aptr, *bptr, *cptr;
+    int grid_id;               /* Process rank */
 
-    if (m * n * sizeof(datatype) > CACHE_SIZE) { /* block B doesn't fit in cache */
-        lhalf[0] = 0;
-        lhalf[1] = l / 2;
-        lhalf[2] = l - l / 2;
-        mhalf[0] = 0;
-        mhalf[1] = m / 2;
-        mhalf[2] = m - m / 2;
-        nhalf[0] = 0;
-        nhalf[1] = n / 2;
-        nhalf[2] = n - n / 2;
-        for (i = 0; i < 2; i++)
-            for (j = 0; j < 2; j++)
-                for (k = 0; k < 2; k++)
-                    my_matmul(crow + lhalf[i], ccol + nhalf[j],
-                              arow + lhalf[i], acol + mhalf[k],
-                              brow + mhalf[k], bcol + nhalf[j],
-                              lhalf[i + 1], mhalf[k + 1], nhalf[j + 1],
-                              N, a, b, c);
-    } else { /* block B fits in cache */
-        for (i = 0; i < l; i++) {
-            for (j = 0; j < n; j++) {
-                cptr = &c[crow + i][ccol + j];
-                aptr = &a[arow + i][acol];
-                bptr = &b[brow][bcol + j];
-                for (k = 0; k < m; k++) {
-                    *cptr += *(aptr++) * (*bptr);
-                    bptr += N;
-                }
-            }
+    /* This assumes the matrices are square and the
+       blocks are also square. */
+    MPI_Comm_rank(grid_comm, &grid_id);
+
+    for (i = 0; i < ldim; i++) {
+        for (j = 0; j < ldim; j++) {
+            for (k = 0; k < ldim; k++)
+                (*c)[i][j] += a[i][k] * b[k][j];
         }
     }
 }
 
-void mat_mul(int n, datatype **a, datatype **b, datatype **c) {
-    my_matmul(0, 0, 0, 0, 0, 0, n, n, n, n, a, b, c);
+void allocate_2D_matrix(datatype ***mat, int rows, int cols) {
+    *mat = (datatype **) malloc(rows * sizeof(datatype *));
+    (*mat)[0] = (datatype *) malloc(rows * cols * sizeof(datatype));
+    for (int i = 1; i < rows; i++) {
+        (*mat)[i] = (*mat)[0] + i * cols;
+    }
+}
+
+void free_2D_matrix(datatype **mat) {
+    free(mat[0]);
+    free(mat);
 }
 
 int main(int argc, char *argv[]) {
-    int p, p_sqrt;
-    int id, coord[2];
-    int dim[2], period[2];
-    MPI_Comm comm;
-    int ma, na, mb, nb, n;
-    datatype **a, *sa;
-    datatype **b, *sb;
-    datatype **c, *sc;
+    int grid_id;
+    int grid_size[2];
+    int grid_coord[2];
+    int i, j;
+    int ldim;                   /* Leading dimension of */
+    int n;
+    int nblocks;
+    int size;
+    MPI_Comm grid_comm;
 
-    /* initialize MPI */
     MPI_Init(&argc, &argv);
 
-    /* start couting time */
-    MPI_Barrier(MPI_COMM_WORLD);
-    double elapsed_time = -MPI_Wtime();
+    if (argc != 4)
+        my_abort("Usage: %s <fileA> <fileB> <fileC>\n", argv[0]);
 
-    /* make sure the number of arguments is correct */
-    if (argc != 4) {
-        my_abort("Usage: %s fileA fileB fileC\n", argv[0]);
+    setup_grid(&grid_comm, grid_size, &grid_id, grid_coord);
+
+    if (grid_id == 0) {
+        check_input_files(argv);
     }
 
-    /* create 2D cartesion communicator and obtain the system configurations */
-    MPI_Comm_size(MPI_COMM_WORLD, &p);
+    MPI_Barrier(grid_comm);
 
-    p_sqrt = (int) sqrt(p);
+    datatype **a, **b, **c;
+    void *a_storage, *b_storage, *c_storage;
 
-    if (p_sqrt * p_sqrt != p) {
-        my_abort("Error: number of processors (p=%d) must be a square number", p);
+    read_checkerboard_matrix(argv[1], (void ***)&a, &a_storage, mpitype, &n, &n, grid_comm);
+    read_checkerboard_matrix(argv[2], (void ***)&b, &b_storage, mpitype, &n, &n, grid_comm);
+
+    get_local_matrix_size(n, grid_size[0], grid_coord[0], &ldim);
+    allocate_2D_matrix(&c, ldim, ldim);
+    memset(&c[0][0], 0, ldim * ldim * sizeof(datatype));
+
+    for (i = 0; i < grid_size[0]; i++) {
+        int k = (grid_coord[0] + i) % grid_size[0];
+        int dest = (grid_coord[0] + grid_size[0] - 1) % grid_size[0];
+        int src = (grid_coord[0] + 1) % grid_size[0];
+
+        matmul(a, b, &c, ldim, grid_comm);
+        MPI_Sendrecv_replace(&a[0][0], ldim * ldim, mpitype, dest, 0, src, 0, grid_comm, MPI_STATUS_IGNORE);
+
+        dest = (grid_coord[1] + grid_size[1] - 1) % grid_size[1];
+        src = (grid_coord[1] + 1) % grid_size[1];
+        MPI_Sendrecv_replace(&b[0][0], ldim * ldim, mpitype, dest, 0, src, 0, grid_comm, MPI_STATUS_IGNORE);
     }
 
-    dim[0] = dim[1] = p_sqrt;
-    period[0] = period[1] = 1;
-    MPI_Cart_create(MPI_COMM_WORLD, 2, dim, period, 0, &comm);
-    MPI_Comm_rank(comm, &id);
-    MPI_Cart_coords(comm, id, 2, coord);
+    write_checkerboard_matrix(argv[3], (void **)c, mpitype, n, n, grid_comm);
 
-    /* checking input files are accessible */
-    check_input_files(argv);
-
-    /* read the submatrix of A managed by this process */
-    read_checkerboard_matrix(argv[1], (void ***) &a, (void **) &sa, mpitype, &ma, &na, comm);
-    printf("id=%d, coord[%d,%d]: read submatrix of A of dims %dx%d\n", id, coord[0], coord[1], ma, na);
-    /* YOUR CODE: sanity checks as necessary */
-
-    if (sqrt(ma * na) != ma || sqrt(ma * na) != na) {
-        my_abort("id = %d, matrix A is not squared", id);
-    }
-
-    /* read the submatrix of B managed by this process */
-    read_checkerboard_matrix(argv[2], (void ***) &b, (void **) &sb, mpitype, &mb, &nb, comm);
-    printf("id=%d, coord[%d,%d]: read submatrix of B of dims %dx%d\n", id, coord[0], coord[1], mb, nb);
-
-    /* YOUR CODE: sanity checks as necessary (such as matrix compatibility) */
-
-    if (sqrt(mb * nb) != mb || sqrt(mb * nb) != nb) {
-        my_abort("id = %d, matrix B is not squared", id);
-    }
-
-    if (ma != mb || na != nb) {
-        my_abort("id = %d, matrix A and B have different dimensions", id);
-    }
-
-    if (ma % p_sqrt != 0) {
-        my_abort("id = %d, sqrt(%d) = %d cannot divide the number of rows %d", id, p, p_sqrt, ma);
-    }
-
-    if (na % p_sqrt != 0) {
-        my_abort("id = %d, sqrt(%d) = %d cannot divide the number of columns %d", id, p, p_sqrt, na);
-    }
-
-    /* YOUR CODE: THE CANNON ALGORITHM STARTS HERE */
-
-    n = ma / p_sqrt; /* IMPORTANT: we don't have the entire matrix; only the sub */
-
-    int source, dest;
-
-    datatype **partial_c_matrix = init_partial_c_matrix(n);
-
-    MPI_Cart_shift(comm, 1, coord[0], &source, &dest);
-    MPI_Sendrecv_replace(sa, n * n, mpitype, dest, 0, source, 0, comm, MPI_STATUS_IGNORE);
-
-    MPI_Cart_shift(comm, 0, coord[1], &source, &dest);
-    MPI_Sendrecv_replace(sb, n * n, mpitype, dest, 0, source, 0, comm, MPI_STATUS_IGNORE);
-
-    reconstruct_matrix(n, n, a, sa);
-    reconstruct_matrix(n, n, b, sb);
-
-    for (int i = 0; i < p_sqrt; ++i) {
-        c = init_local_c(n, c, sc);
-
-        mat_mul(n, a, b, c);
-
-        sum(n, c, partial_c_matrix);
-
-        MPI_Cart_shift(comm, 1, 1, &source, &dest);
-        MPI_Sendrecv_replace(sa, n * n, mpitype, dest, 0, source, 0, comm, MPI_STATUS_IGNORE);
-
-        MPI_Cart_shift(comm, 0, 1, &source, &dest);
-        MPI_Sendrecv_replace(sb, n * n, mpitype, dest, 0, source, 0, comm, MPI_STATUS_IGNORE);
-
-        reconstruct_matrix(n, n, a, sa);
-        reconstruct_matrix(n, n, b, sb);
-    }
-
-    /* write the submatrix of C managed by this process */
-    write_checkerboard_matrix(argv[3], (void **) partial_c_matrix, mpitype, ma, mb, comm);
-
-    /* final timing */
-    elapsed_time += MPI_Wtime();
-
-    if (!id) {
-        printf("elapsed time: %lf\n", elapsed_time);
-    }
+    free_2D_matrix(a);
+    free_2D_matrix(b);
+    free_2D_matrix(c);
+    free(a_storage);
+    free(b_storage);
+    free(c_storage);
 
     MPI_Finalize();
 
     return 0;
-}
-
-void check_input_files(char *const *argv) {
-    if (cfileexists(argv[1]) == 0) {
-        my_abort("Error: File %s is not accessible\n", argv[1]);
-    }
-
-    if (cfileexists(argv[2]) == 0) {
-        my_abort("Error: File %s is not accessible\n", argv[2]);
-    }
-}
-
-int cfileexists(const char *filename) {
-    /* try to open file to read */
-    FILE *file;
-    if (file = fopen(filename, "r")) {
-        fclose(file);
-        return 1;
-    }
-    return 0;
-}
-
-void sum(int n, datatype *const *c, datatype *const *partial_c_matrix) {
-    for (int ii = 0; ii < n; ++ii) {
-        for (int jj = 0; jj < n; ++jj) {
-            partial_c_matrix[ii][jj] += c[ii][jj];
-        }
-    }
-}
-
-datatype **init_local_c(int n, datatype **c, datatype *sc) {
-    sc = (datatype *) malloc(n * n * sizeof(datatype));
-    memset(sc, 0, n * n * sizeof(datatype));
-
-    c = (datatype **) malloc(n * sizeof(datatype *));
-
-    for (int j = 0; j < n; j++) {
-        c[j] = &sc[j * n];
-    }
-
-    return c;
-}
-
-datatype **init_partial_c_matrix(int n) {
-    datatype **partial_c_matrix = calloc((size_t) n, sizeof(datatype *));
-
-    for (int i = 0; i < n; ++i) {
-        partial_c_matrix[i] = calloc((size_t) n, sizeof(datatype));
-
-        for (int j = 0; j < n; ++j) {
-            partial_c_matrix[i][j] = 0;
-        }
-    }
-    return partial_c_matrix;
-}
-
-void reconstruct_matrix(int ma, int na, datatype *const *a, const datatype *sa) {
-    int k = 0;
-
-    for (int i = 0; i < ma; ++i) {
-        for (int j = 0; j < na; ++j) {
-            a[i][j] = sa[k++];
-        }
-    }
 }
