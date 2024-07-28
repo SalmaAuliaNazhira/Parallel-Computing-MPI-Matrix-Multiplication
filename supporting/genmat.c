@@ -21,7 +21,7 @@ int main (int argc, char * argv[])
   struct timeval tp;
   
   if(argc != 4) {
-    printf("Usage: %s rows columns filename\n", argv[0]);
+    printf("Usage: %s rows columns process filename\n", argv[0]);
     return 1;
   }
 
